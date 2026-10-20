@@ -437,6 +437,33 @@ class PetData:
         self.day_record()["timed_minutes"] = round(minutes, 4)
         return minutes
 
+    def backfill_today(self, now: datetime | None = None) -> float:
+        """重启补算：当天计时窗口内已流逝、但程序未运行的时间也计入。
+
+        日薪按 11h 时间窗走，中途退出/关机不该丢钱 → 每次启动先补齐当天应得工时。
+        手动暂停（rec["paused"]=True）或手动计时模式下不补算，尊重用户意图。
+        只增不减（已记录的计时分钟不倒退）。
+        """
+        if not self.data.get("auto_schedule", True):
+            return 0.0
+        rec = self.day_record(create=False)
+        if rec and rec.get("paused"):
+            return 0.0
+        now = now or datetime.now()
+        if now.weekday() in self.data.get("rest_weekdays", [6]):
+            return 0.0
+        segs = self.schedule_segments()
+        if not segs:
+            return 0.0
+        nm = now.hour * 60 + now.minute + now.second / 60.0
+        minutes = sum(max(0.0, min(nm, e) - s) for s, e in segs)
+        minutes = min(minutes, self.cap())
+        existing = float(rec.get("timed_minutes", 0.0)) if rec else 0.0
+        if minutes > existing + 0.01:
+            self.set_timed_minutes(minutes)
+            return minutes
+        return 0.0
+
     def timed_income(self, day: str | None = None) -> float:
         rec = self.day_record(day, create=False)
         return (rec.get("timed_minutes", 0.0) if rec else 0.0) * self.per_minute()
@@ -614,6 +641,11 @@ class DesktopPetApp:
 
         self._resize()
         threading.Thread(target=self._watch_hotkey, daemon=True).start()
+        # 重启补算：当天窗口内已流逝但程序未运行的时间（中途退出/关机）自动补齐
+        backfilled = self.data.backfill_today()
+        if backfilled > 0.5:
+            self.show_bubble("已自动补算 {} 分钟\n今日 {}".format(
+                int(round(backfilled)), _fmt(self.data.day_income())), 4.0)
         self._tick()
 
     @staticmethod
@@ -792,6 +824,8 @@ class DesktopPetApp:
     def _start_work(self, announce: bool = True):
         self._manual_pause = False
         rec = self.data.day_record(create=False)
+        if rec is not None:
+            rec.pop("paused", None)  # 手动恢复 → 解除暂停标记
         existing = float(rec.get("timed_minutes", 0.0)) if rec else 0.0
         if existing >= self.data.cap():
             if announce:
@@ -812,6 +846,8 @@ class DesktopPetApp:
         self.base_minutes = minutes
         self.working = False
         self._manual_pause = True
+        rec = self.data.day_record()
+        rec["paused"] = True  # 持久化：重启后不自动补算/重启，尊重暂停意图
         self.data.save()
         self.show_bubble("已暂停\n今日 " + _fmt(self.data.day_income()), 2.5)
 
@@ -819,11 +855,13 @@ class DesktopPetApp:
         """自动排班：到点自动开工 / 收工。手动暂停后当日内不再自动重启。"""
         if not self.data.data.get("auto_schedule", True):
             return
+        rec = self.data.day_record(create=False)
+        paused_today = bool(rec and rec.get("paused"))
         in_win = self.data.in_work_window()
         if in_win != self._last_in_win:
             self._last_in_win = in_win
             self._manual_pause = False
-        if in_win and not self.working and not self._manual_pause:
+        if in_win and not self.working and not self._manual_pause and not paused_today:
             if self.base_minutes < self.data.cap():
                 self._start_work(announce=False)
                 self.show_bubble("到点自动开工\n每分钟 " + _fmt(self.data.per_minute()), 4.0)
@@ -1341,7 +1379,11 @@ class DesktopPetApp:
     # ---------- 退出 ----------
     def quit(self):
         if self.working:
-            self._pause_work()
+            # 退出 ≠ 暂停：只保存当前进度，不打 paused 标记，重启后按时间窗自动补算
+            minutes = min(self.data.cap(),
+                          self.base_minutes + (time.time() - self.session_start) / 60.0)
+            self.data.set_timed_minutes(minutes)
+            self.working = False
         self._stop.set()
         if self._tip is not None:
             self._tip.destroy()

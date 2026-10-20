@@ -173,6 +173,40 @@ def main():
     d4b = PetData(path)
     assert d4b.data["salary_basis"] == "workdays", "v2 后用户修改不被覆盖"
 
+    # ---- 重启补算（退出不丢窗口内时间，暂停不补）----
+    d2.data["rest_weekdays"] = []
+    d2.data["auto_schedule"] = True
+    d2.data["work_segments"] = [["08:30", "19:30"]]
+    d2.day_record().pop("paused", None)
+    # 17:42 启动：应补到 8:30 起已流逝的 552 分钟
+    d2.set_timed_minutes(398.9)  # 模拟中途退出只存了这些
+    got = d2.backfill_today(datetime(2026, 10, 20, 17, 42))
+    assert abs(got - 552.0) < 1e-6, "重启补算窗口内已流逝时间"
+    assert abs(d2.day_record()["timed_minutes"] - 552.0) < 1e-6
+    # 只增不减：已有 600 分钟时保持
+    d2.set_timed_minutes(600.0)
+    got = d2.backfill_today(datetime(2026, 10, 20, 18, 0))
+    assert got == 0.0 and abs(d2.day_record()["timed_minutes"] - 600.0) < 1e-6
+    # 封顶 cap
+    d2.set_timed_minutes(10.0)
+    got = d2.backfill_today(datetime(2026, 10, 20, 21, 0))
+    assert abs(got - 660.0) < 1e-6, "19:30 后补满 660"
+    # 手动暂停 → 不补
+    d2.set_timed_minutes(100.0)
+    d2.day_record()["paused"] = True
+    got = d2.backfill_today(datetime(2026, 10, 20, 17, 42))
+    assert got == 0.0 and abs(d2.day_record()["timed_minutes"] - 100.0) < 1e-6
+    d2.day_record().pop("paused", None)
+    # 周日 → 不补
+    d2.data["rest_weekdays"] = [6]
+    d2.set_timed_minutes(0.0)
+    assert d2.backfill_today(datetime(2026, 10, 18, 12, 0)) == 0.0, "周日不计时"
+    # 手动模式 → 不补
+    d2.data["rest_weekdays"] = []
+    d2.data["auto_schedule"] = False
+    assert d2.backfill_today(datetime(2026, 10, 20, 17, 42)) == 0.0
+    d2.data["auto_schedule"] = True
+
     # ---- 坏配置不崩溃（回退默认口径）----
     with open(path, "w", encoding="utf-8") as f:
         f.write("{ not valid json")
